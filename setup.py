@@ -40,13 +40,17 @@ except Exception, e:
     traceback.print_exc()
     long_description = ''
 
-luigi_package_data = [os.path.join(dirpath.replace("luigi/", ""), ext)
-                      for (dirpath, dirnames, filenames) in os.walk("luigi/static")
-                      for ext in ["*.html", "*.js", "*.css", "*.png"]]
+
+def get_static_files(path):
+    return [os.path.join(dirpath.replace("luigi/", ""), ext) 
+            for (dirpath, dirnames, filenames) in os.walk(path)
+            for ext in ["*.html", "*.js", "*.css", "*.png"]]
+
+luigi_package_data = sum(map(get_static_files, ["luigi/static", "luigi/templates"]), [])
 
 setup(
     name='luigi',
-    version='1.0.13',
+    version='1.0.13-df',
     description='Workflow mgmgt + task scheduling + dependency resolution',
     long_description=long_description,
     author='Erik Bernhardsson',
