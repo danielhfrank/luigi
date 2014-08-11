@@ -16,6 +16,7 @@ import random
 from scheduler import CentralPlannerScheduler, PENDING, FAILED, DONE
 import collections
 import threading
+import multiprocessing
 import time
 import os
 import socket
@@ -39,6 +40,7 @@ logger = logging.getLogger('luigi-interface')
 class TaskException(Exception):
     pass
 
+TaskResult = collections.namedtuple("TaskResult", ['error', 'task', 'missing'])
 
 class Event:
     # TODO nice descriptive subclasses of Event instead of strings? pass their instances to the callback instead of an undocumented arg list?
@@ -50,6 +52,23 @@ class Event:
     FAILURE = "event.core.failure"
     SUCCESS = "event.core.success"
 
+class WorkerResultsResponder(threading.Thread):
+    def __init__(self, worker):
+        super(KeepAliveThread, self).__init__()
+        self._should_stop = threading.Event()
+        self.worker = worker
+
+    def stop(self):
+        self._should_stop.set()
+
+    def run(self):
+        while True:
+            self._should_stop.wait(1.0)
+            if self._should_stop.is_set():
+                break
+            task_result = self.worker.task_results_queue.get()
+            self.worker._handle_task_result(task_result)
+            self.worker.task_results_queue.task_done()
 
 class Worker(object):
     """ Worker object communicates with a scheduler.
@@ -93,6 +112,11 @@ class Worker(object):
             worker_processes = 1
 
         self.worker_processes = worker_processes
+        if self.worker_processes > 1:
+            self.worker_pool = multiprocessing.Pool(self.worker_processes)
+            self.worker_pool_lock = threading.Semaphore(self.worker_processes)
+            self.task_results_queue = Queue.Queue()
+
         self.host = socket.gethostname()
         self._scheduled_tasks = {}
 
@@ -126,6 +150,10 @@ class Worker(object):
         self._keep_alive_thread.daemon = True
         self._keep_alive_thread.start()
 
+        self._task_results_thread = WorkerResultsResponder(self)
+        self._task_results_thread.daemon = True
+        self._task_results_thread.start()
+
     def stop(self):
         """ Stop the KeepAliveThread associated with this Worker
             This should be called whenever you are done with a worker instance to clean up
@@ -139,6 +167,13 @@ class Worker(object):
         """
         self._keep_alive_thread.stop()
         self._keep_alive_thread.join()
+
+        # hope this is in the right order..
+        # block until all items have been processed
+        self.task_results_queue.join()
+        # tell the thread to stop
+        self._task_results_thread.stop()
+        # wait for it to actually stop
 
     def graceful_shutdown(self):
         """
@@ -328,6 +363,41 @@ class Worker(object):
         self.run_succeeded &= status == DONE
         return status
 
+
+    def _handle_task_result(self, task_result):
+        if task_result.error is None:
+            status = DONE
+            error_message = json.dumps(task.on_success())
+            logger.info('[pid %s] Worker %s done      %s', os.getpid(), self._id, task_id)
+            task.trigger_event(Event.SUCCESS, task)
+        else:
+            # TODO special handling of KeyboardInterupt
+            status = FAILED
+            logger.exception("[pid %s] Worker %s failed    %s", os.getpid(), self._id, task)
+            error_message = task.on_failure(ex)
+            task.trigger_event(Event.FAILURE, task, ex)
+            subject = "Luigi: %s FAILED" % task
+            notifications.send_error_email(subject, error_message)
+
+        self._scheduler.add_task(self._id, task.task_id, status=status,
+                                  expl=error_message, runnable=None)
+
+        # re-add task to reschedule missing dependencies
+        if task_result.missing:
+            reschedule = True
+
+            # keep out of infinite loops by not rescheduling too many times
+            for task_id in task_result.missing:
+                # NB: we only touch this var from within this thread
+                self.unfulfilled_counts[task_id] += 1
+                if self.unfulfilled_counts[task_id] > self.__max_reschedules:
+                    reschedule = False
+            if reschedule:
+                self.add(task)
+
+        # TODO this is sketchy...
+        self.run_succeeded &= status == DONE
+
     def _add_worker(self):
         try:
             self._scheduler.add_worker(self._id, self._worker_info)
@@ -422,3 +492,62 @@ class Worker(object):
         while children:
             self._reap_children(children)
         return self.run_succeeded
+
+
+    def run_loop(self):
+        sleeper  = self._sleeper()
+        while not self.graceful_shutdown_initiated:
+            # block until we can get more work
+            self.worker_pool_lock.acquire()
+            # check if this was set while we were waiting
+            if self.graceful_shutdown_initiated:
+                self.worker_pool_lock.release()
+                break
+            task_id, running_tasks, n_pending_tasks = self._get_work()
+
+            if task_id is None:
+                self.worker_pool_lock.release()
+                self._log_remote_tasks(running_tasks, n_pending_tasks)
+                # TODO don't kill worker if there are tasks still running?
+                # (or, could just follow graceful procedure, which is OK I think)
+                if self.__keep_alive and running_tasks and n_pending_tasks:
+                    sleeper.next()
+                    continue
+                else:
+                    break
+
+            # task_id is not None:
+            logger.debug("Pending tasks: %s", n_pending_tasks)
+            task = self._scheduled_tasks[task_id]
+            def task_result_callback(result):
+                self.task_results_queue.put_nowait(result)
+                self.worker_pool_lock.release()
+
+            self.worker_pool.apply_async(mp_run_task, (task,),
+                callback=task_result_callback)
+        # when loop has exited, clean up worker pool and stuff
+        # first, prevent more tasks from being submitted
+        self.worker_pool.close()
+        # now we can block until tasks have been completed
+        self.worker_pool.join()
+
+def mp_run_task(task):
+    """
+    Make simple attempt to run task, and return any error that occurred.
+    Suitable to be run by multiprocess pool; Doesn't have access to any
+    worker attributes
+    """
+    missing = []
+    error = None
+    try:
+        # Verify that all the tasks are fulfilled!
+        missing = [dep.task_id for dep in task.deps() if not dep.complete()]
+        if missing:
+            deps = 'dependency' if len(missing) == 1 else 'dependencies'
+            raise RuntimeError('Unfulfilled %s at run time: %s' % (deps, ', '.join(missing)))
+        task.trigger_event(Event.START, task)
+
+        task.run()
+    except Exception as ex:
+        error = ex
+    return TaskResult(error, task, missing)
